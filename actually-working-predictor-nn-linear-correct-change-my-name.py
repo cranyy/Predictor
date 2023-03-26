@@ -1,158 +1,334 @@
-import pandas as pd
 import numpy as np
-import yfinance as yf
-import datetime as dt
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
-import multiprocessing as mp
-import platform
-import logging
-from tqdm import tqdm
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
-import ta
-from sklearn.linear_model import LinearRegression
 
-# Define the URL for the S&P 500 company list
-url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 
-def linear_regression_model(stock_data):
-    stock_data = stock_data.dropna()
-    X = stock_data[['7_day_mean', '30_day_mean', '365_day_mean']]
-    y = stock_data['Close']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-    model = LinearRegression()
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
-    last_30_days = stock_data[['7_day_mean', '30_day_mean', '365_day_mean']].tail(30)
-    last_30_days_scaled = scaler.transform(last_30_days)
-    future_prices = model.predict(last_30_days_scaled)
-    return mse, future_prices
+import matplotlib.pyplot as plt
+from matplotlib.pyplot import figure
 
-def add_RSI(stock_data, period=14):
-    rsi = ta.momentum.RSIIndicator(close=stock_data["Close"], window=period)
-    stock_data["RSI"] = rsi.rsi()
+from alpha_vantage.timeseries import TimeSeries 
 
-def add_MACD(stock_data, short_period=12, long_period=26, signal_period=9):
-    macd = ta.trend.MACD(close=stock_data["Close"], window_slow=long_period, window_fast=short_period, window_sign=signal_period)
-    stock_data["MACD"] = macd.macd()
-    stock_data["MACD_Signal"] = macd.macd_signal()
+print("All libraries loaded")
+plt.ion() 
 
-def add_Bollinger_Bands(stock_data, period=20, std_dev=2):
-    bollinger = ta.volatility.BollingerBands(close=stock_data["Close"], window=period, window_dev=std_dev)
-    stock_data["Bollinger_High"] = bollinger.bollinger_hband()
-    stock_data["Bollinger_Low"] = bollinger.bollinger_lband()
+config = {
+    "alpha_vantage": {
+        "key": "GIABJWZQHDTVAHXM", # you can use the demo API key for this project, but please make sure to get your own API key at https://www.alphavantage.co/support/#api-key
+        "symbol": "IBM",
+        "outputsize": "full",
+        "key_adjusted_close": "5. adjusted close",
+    },
+    "data": {
+        "window_size": 20,
+        "train_split_size": 0.80,
+    }, 
+    "plots": {
+        "xticks_interval": 90, # show a date every 90 days
+        "color_actual": "#001f3f",
+        "color_train": "#3D9970",
+        "color_val": "#0074D9",
+        "color_pred_train": "#3D9970",
+        "color_pred_val": "#0074D9",
+        "color_pred_test": "#FF4136",
+    },
+    "model": {
+        "input_size": 1, # since we are only using 1 feature, close price
+        "num_lstm_layers": 2,
+        "lstm_size": 32,
+        "dropout": 0.2,
+    },
+    "training": {
+        "device": "cpu", # "cuda" or "cpu"
+        "batch_size": 64,
+        "num_epoch": 100,
+        "learning_rate": 0.01,
+        "scheduler_step_size": 40,
+    }
+}
 
-def get_stock_data(ticker, start, end):
-    stock_data = yf.download(ticker, start=start, end=end)
-    return stock_data
+def download_data(config):
+    ts = TimeSeries(key='GIABJWZQHDTVAHXM') #you can use the demo API key for this project, but please make sure to eventually get your own API key at https://www.alphavantage.co/support/#api-key. 
+    data, meta_data = ts.get_daily_adjusted(config["alpha_vantage"]["symbol"], outputsize=config["alpha_vantage"]["outputsize"])
 
-def add_features(stock_data):
-    stock_data['7_day_mean'] = stock_data['Close'].rolling(window=7).mean()
-    stock_data['30_day_mean'] = stock_data['Close'].rolling(window=30).mean()
-    stock_data['365_day_mean'] = stock_data['Close'].rolling(window=365).mean()
-    add_RSI(stock_data)
-    add_MACD(stock_data)
-    add_Bollinger_Bands(stock_data)
-    return stock_data
+    data_date = [date for date in data.keys()]
+    data_date.reverse()
 
-def get_action(current_price, future_price):
-    if future_price > current_price * 1.01:
-        return 'BUY'
-    elif future_price < current_price * 0.99:
-        return 'SELL'
+    data_close_price = [float(data[date][config["alpha_vantage"]["key_adjusted_close"]]) for date in data.keys()]
+    data_close_price.reverse()
+    data_close_price = np.array(data_close_price)
+
+    num_data_points = len(data_date)
+    display_date_range = "from " + data_date[0] + " to " + data_date[num_data_points-1]
+    print("Number data points", num_data_points, display_date_range)
+
+    return data_date, data_close_price, num_data_points, display_date_range
+
+data_date, data_close_price, num_data_points, display_date_range = download_data(config)
+
+# plot
+# First plot
+fig = figure(figsize=(25, 5), dpi=80)
+fig.patch.set_facecolor((1.0, 1.0, 1.0))
+plt.plot(data_date, data_close_price, color=config["plots"]["color_actual"])
+xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_data_points-i) > config["plots"]["xticks_interval"]) or i==num_data_points-1) else None for i in range(num_data_points)] # make x ticks nice
+x = np.arange(0,len(xticks))
+plt.xticks(x, xticks, rotation='vertical')
+plt.title("Daily close price for " + config["alpha_vantage"]["symbol"] + ", " + display_date_range)
+plt.grid(which='major', axis='y', linestyle='--')  # Removed the b=None argument
+plt.pause(0.1)  # Display the plot for a short interval and continue execution
+
+class Normalizer():
+    def __init__(self):
+        self.mu = None
+        self.sd = None
+
+    def fit_transform(self, x):
+        self.mu = np.mean(x, axis=(0), keepdims=True)
+        self.sd = np.std(x, axis=(0), keepdims=True)
+        normalized_x = (x - self.mu)/self.sd
+        return normalized_x
+
+    def inverse_transform(self, x):
+        return (x*self.sd) + self.mu
+
+# normalize
+scaler = Normalizer()
+normalized_data_close_price = scaler.fit_transform(data_close_price)
+
+def prepare_data_x(x, window_size):
+    # perform windowing
+    n_row = x.shape[0] - window_size + 1
+    output = np.lib.stride_tricks.as_strided(x, shape=(n_row, window_size), strides=(x.strides[0], x.strides[0]))
+    return output[:-1], output[-1]
+
+
+def prepare_data_y(x, window_size):
+    # # perform simple moving average
+    # output = np.convolve(x, np.ones(window_size), 'valid') / window_size
+
+    # use the next day as label
+    output = x[window_size:]
+    return output
+
+data_x, data_x_unseen = prepare_data_x(normalized_data_close_price, window_size=config["data"]["window_size"])
+data_y = prepare_data_y(normalized_data_close_price, window_size=config["data"]["window_size"])
+
+# split dataset
+
+split_index = int(data_y.shape[0]*config["data"]["train_split_size"])
+data_x_train = data_x[:split_index]
+data_x_val = data_x[split_index:]
+data_y_train = data_y[:split_index]
+data_y_val = data_y[split_index:]
+
+# prepare data for plotting
+
+to_plot_data_y_train = np.zeros(num_data_points)
+to_plot_data_y_val = np.zeros(num_data_points)
+
+to_plot_data_y_train[config["data"]["window_size"]:split_index+config["data"]["window_size"]] = scaler.inverse_transform(data_y_train)
+to_plot_data_y_val[split_index+config["data"]["window_size"]:] = scaler.inverse_transform(data_y_val)
+
+to_plot_data_y_train = np.where(to_plot_data_y_train == 0, None, to_plot_data_y_train)
+to_plot_data_y_val = np.where(to_plot_data_y_val == 0, None, to_plot_data_y_val)
+
+## plots
+
+fig = figure(figsize=(25, 5), dpi=80)
+fig.patch.set_facecolor((1.0, 1.0, 1.0))
+plt.plot(data_date, to_plot_data_y_train, label="Prices (train)", color=config["plots"]["color_train"])
+plt.plot(data_date, to_plot_data_y_val, label="Prices (validation)", color=config["plots"]["color_val"])
+xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_data_points-i) > config["plots"]["xticks_interval"]) or i==num_data_points-1) else None for i in range(num_data_points)] # make x ticks nice
+x = np.arange(0,len(xticks))
+plt.xticks(x, xticks, rotation='vertical')
+plt.title("Daily close prices for " + config["alpha_vantage"]["symbol"] + " - showing training and validation data")
+plt.grid(which='major', axis='y', linestyle='--')
+plt.legend()
+plt.pause(0.1)  # Display the plot for a short interval and continue execution
+plt.show()
+plt.pause(0.1)
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, x, y):
+        x = np.expand_dims(x, 2) # in our case, we have only 1 feature, so we need to convert `x` into [batch, sequence, features] for LSTM
+        self.x = x.astype(np.float32)
+        self.y = y.astype(np.float32)
+        
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, idx):
+        return (self.x[idx], self.y[idx])
+
+dataset_train = TimeSeriesDataset(data_x_train, data_y_train)
+dataset_val = TimeSeriesDataset(data_x_val, data_y_val)
+
+print("Train data shape", dataset_train.x.shape, dataset_train.y.shape)
+print("Validation data shape", dataset_val.x.shape, dataset_val.y.shape)
+
+train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=True)
+val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size=1, hidden_layer_size=32, num_layers=2, output_size=1, dropout=0.2):
+        super().__init__()
+        self.hidden_layer_size = hidden_layer_size
+
+        self.linear_1 = nn.Linear(input_size, hidden_layer_size)
+        self.relu = nn.ReLU()
+        self.lstm = nn.LSTM(hidden_layer_size, hidden_size=self.hidden_layer_size, num_layers=num_layers, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+        self.linear_2 = nn.Linear(num_layers*hidden_layer_size, output_size)
+        
+        self.init_weights()
+
+    def init_weights(self):
+        for name, param in self.lstm.named_parameters():
+            if 'bias' in name:
+                 nn.init.constant_(param, 0.0)
+            elif 'weight_ih' in name:
+                 nn.init.kaiming_normal_(param)
+            elif 'weight_hh' in name:
+                 nn.init.orthogonal_(param)
+
+    def forward(self, x):
+        batchsize = x.shape[0]
+
+        # layer 1
+        x = self.linear_1(x)
+        x = self.relu(x)
+        
+        # LSTM layer
+        lstm_out, (h_n, c_n) = self.lstm(x)
+
+        # reshape output from hidden cell into [batch, features] for `linear_2`
+        x = h_n.permute(1, 0, 2).reshape(batchsize, -1) 
+        
+        # layer 2
+        x = self.dropout(x)
+        predictions = self.linear_2(x)
+        return predictions[:,-1]
+    
+def run_epoch(dataloader, is_training=False):
+    epoch_loss = 0
+
+    if is_training:
+        model.train()
     else:
-        return 'UNKNOWN'
+        model.eval()
 
-def neural_network_model(stock_data):
-    stock_data = stock_data.dropna()
-    X = stock_data[['7_day_mean', '30_day_mean', '365_day_mean', 'RSI', 'MACD', 'MACD_Signal', 'Bollinger_High', 'Bollinger_Low']]
-    y = stock_data['Close']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    for idx, (x, y) in enumerate(dataloader):
+        if is_training:
+            optimizer.zero_grad()
 
-    model = Sequential()
-    model.add(Dense(50, input_dim=X_train.shape[1], activation='relu'))
-    model.add(Dense(30, activation='relu'))
-    model.add(Dense(1))
-    model.compile(loss='mean_squared_error', optimizer='adam')
-    model.fit(X_train, y_train, epochs=100, batch_size=32, verbose=0)
+        batchsize = x.shape[0]
 
-    y_pred = model.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
+        x = x.to(config["training"]["device"])
+        y = y.to(config["training"]["device"])
 
-    last_30_days = stock_data[['7_day_mean', '30_day_mean', '365_day_mean', 'RSI', 'MACD', 'MACD_Signal', 'Bollinger_High', 'Bollinger_Low']].tail(30)
-    last_30_days_scaled = scaler.transform(last_30_days)
-    future_prices = model.predict(last_30_days_scaled)
-    return mse, future_prices
+        out = model(x)
+        loss = criterion(out.contiguous(), y.contiguous())
 
-start = dt.datetime(2010, 1, 1)
-end = dt.datetime.now()
+        if is_training:
+            loss.backward()
+            optimizer.step()
 
-# Retrieve S&P 500 stock tickers from Wikipedia
-wiki_table = pd.read_html(url)[0]
-sp500_list = wiki_table['Symbol'].tolist()[:10]
+        epoch_loss += (loss.detach().item() / batchsize)
 
-mse_df = pd.DataFrame(columns=['Symbol', 'LR_MSE', 'NN_MSE', '1d_Action', '7d_Action', '1month_Action',
-                               '7_day_mean', '30_day_mean', '365_day_mean', 'RSI', 'MACD', 'MACD_Signal',
-                               'Bollinger_High', 'Bollinger_Low'])
+    lr = scheduler.get_last_lr()[0]
 
-for symbol in tqdm(sp500_list):
-    try:
-        stock_data = get_stock_data(symbol, start, end)
-        stock_data = add_features(stock_data)
-        lr_mse, lr_future_prices = linear_regression_model(stock_data)
-        nn_mse, nn_future_prices = neural_network_model(stock_data)
+    return epoch_loss, lr
 
-        action_1d_nn = get_action(stock_data['Close'].iloc[-1], nn_future_prices[-1])
-        action_7d_nn = get_action(stock_data['Close'].iloc[-1], nn_future_prices[-7])
-        action_1month_nn = get_action(stock_data['Close'].iloc[-1], nn_future_prices[0])
+train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=True)
+val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=True)
 
-        lr_future_price_1d = lr_future_prices[-1]
-        lr_future_price_7d = lr_future_prices[-7]
-        lr_future_price_1month = lr_future_prices[0]
+model = LSTMModel(input_size=config["model"]["input_size"], hidden_layer_size=config["model"]["lstm_size"], num_layers=config["model"]["num_lstm_layers"], output_size=1, dropout=config["model"]["dropout"])
+model = model.to(config["training"]["device"])
 
-        action_1d_lr = get_action(stock_data['Close'].iloc[-1], lr_future_price_1d)
-        action_7d_lr = get_action(stock_data['Close'].iloc[-1], lr_future_price_7d)
-        action_1month_lr = get_action(stock_data['Close'].iloc[-1], lr_future_price_1month)
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"], betas=(0.9, 0.98), eps=1e-9)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=config["training"]["scheduler_step_size"], gamma=0.1)
 
-        last_30_days = stock_data.tail(30)
-        last_30_days_mean = last_30_days[['7_day_mean', '30_day_mean', '365_day_mean', 'RSI', 'MACD', 'MACD_Signal',
-                                           'Bollinger_High', 'Bollinger_Low']].mean()
+for epoch in range(config["training"]["num_epoch"]):
+    loss_train, lr_train = run_epoch(train_dataloader, is_training=True)
+    loss_val, lr_val = run_epoch(val_dataloader)
+    scheduler.step()
+    
+    print('Epoch[{}/{}] | loss train:{:.6f}, test:{:.6f} | lr:{:.6f}'
+              .format(epoch+1, config["training"]["num_epoch"], loss_train, loss_val, lr_train))
+    
+train_dataloader = DataLoader(dataset_train, batch_size=config["training"]["batch_size"], shuffle=False)
+val_dataloader = DataLoader(dataset_val, batch_size=config["training"]["batch_size"], shuffle=False)
 
-        new_row = pd.DataFrame({
-            'Symbol': [symbol],
-            'LR_MSE': [lr_mse],
-            'NN_MSE': [nn_mse],
-            '1d_Action_NN': [action_1d_nn],
-            '7d_Action_NN': [action_7d_nn],
-            '1month_Action_NN': [action_1month_nn],
-            '1d_Action_LR': [action_1d_lr],
-            '7d_Action_LR': [action_7d_lr],
-            '1month_Action_LR': [action_1month_lr],
-            '7_day_mean': [last_30_days_mean['7_day_mean']],
-            '30_day_mean': [last_30_days_mean['30_day_mean']],
-            '365_day_mean': [last_30_days_mean['365_day_mean']],
-            'RSI': [last_30_days_mean['RSI']],
-            'MACD': [last_30_days_mean['MACD']],
-            'MACD_Signal': [last_30_days_mean['MACD_Signal']],
-            'Bollinger_High': [last_30_days_mean['Bollinger_High']],
-            'Bollinger_Low': [last_30_days_mean['Bollinger_Low']]
-        })
+model.eval()
 
-        mse_df = mse_df.append(new_row, ignore_index=True)
-    except Exception as e:
-        print(f"Error processing {symbol}: {e}")
+# predict on the training data, to see how well the model managed to learn and memorize
 
-mse_df.drop(['1d_Action', '7d_Action', '1month_Action'], axis=1, inplace=True)
-mse_df.to_csv('mse_comparison1.csv', index=False)
-print("Analysis completed and saved to mse_comparison.csv")
+predicted_train = np.array([])
 
+for idx, (x, y) in enumerate(train_dataloader):
+    x = x.to(config["training"]["device"])
+    out = model(x)
+    out = out.cpu().detach().numpy()
+    predicted_train = np.concatenate((predicted_train, out))
+
+# predict on the validation data, to see how the model does
+
+predicted_val = np.array([])
+
+for idx, (x, y) in enumerate(val_dataloader):
+    x = x.to(config["training"]["device"])
+    out = model(x)
+    out = out.cpu().detach().numpy()
+    predicted_val = np.concatenate((predicted_val, out))
+
+# prepare data for plotting
+
+to_plot_data_y_train_pred = np.zeros(num_data_points)
+to_plot_data_y_val_pred = np.zeros(num_data_points)
+
+to_plot_data_y_train_pred[config["data"]["window_size"]:split_index+config["data"]["window_size"]] = scaler.inverse_transform(predicted_train)
+to_plot_data_y_val_pred[split_index+config["data"]["window_size"]:] = scaler.inverse_transform(predicted_val)
+
+to_plot_data_y_train_pred = np.where(to_plot_data_y_train_pred == 0, None, to_plot_data_y_train_pred)
+to_plot_data_y_val_pred = np.where(to_plot_data_y_val_pred == 0, None, to_plot_data_y_val_pred)
+
+# plots
+
+fig = figure(figsize=(25, 5), dpi=80)
+fig.patch.set_facecolor((1.0, 1.0, 1.0))
+plt.plot(data_date, data_close_price, label="Actual prices", color=config["plots"]["color_actual"])
+plt.plot(data_date, to_plot_data_y_train_pred, label="Predicted prices (train)", color=config["plots"]["color_pred_train"])
+plt.plot(data_date, to_plot_data_y_val_pred, label="Predicted prices (validation)", color=config["plots"]["color_pred_val"])
+plt.title("Compare predicted prices to actual prices")
+xticks = [data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (num_data_points-i) > config["plots"]["xticks_interval"]) or i==num_data_points-1) else None for i in range(num_data_points)] # make x ticks nice
+x = np.arange(0,len(xticks))
+plt.xticks(x, xticks, rotation='vertical')
+plt.grid(which='major', axis='y', linestyle='--')
+plt.legend()
+plt.show()
+plt.pause(0.1)
+
+# prepare data for plotting the zoomed in view of the predicted prices (on validation set) vs. actual prices
+
+to_plot_data_y_val_subset = scaler.inverse_transform(data_y_val)
+to_plot_predicted_val = scaler.inverse_transform(predicted_val)
+to_plot_data_date = data_date[split_index+config["data"]["window_size"]:]
+
+# plots
+
+fig = figure(figsize=(25, 5), dpi=80)
+fig.patch.set_facecolor((1.0, 1.0, 1.0))
+plt.plot(to_plot_data_date, to_plot_data_y_val_subset, label="Actual prices", color=config["plots"]["color_actual"])
+plt.plot(to_plot_data_date, to_plot_predicted_val, label="Predicted prices (validation)", color=config["plots"]["color_pred_val"])
+plt.title("Zoom in to compare predicted prices to actual prices on validation set")
+xticks = [to_plot_data_date[i] if ((i%config["plots"]["xticks_interval"]==0 and (len(to_plot_data_date)-i) > config["plots"]["xticks_interval"]) or i==len(to_plot_data_date)-1) else None for i in range(len(to_plot_data_date))] # make x ticks nice
+x = np.arange(0,len(xticks))
+plt.xticks(x, xticks, rotation='vertical')
+plt.grid(which='major', axis='y', linestyle='--')
+plt.legend()
+plt.show()
